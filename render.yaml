@@ -3,6 +3,10 @@ services:
     name: pocketfm-telegram-bot
     env: docker
     dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
     envVars:
       - key: TELEGRAM_BOT_TOKEN
-        sync: false
+        sync: false          # set manually in the Render dashboard
+      - key: LOG_LEVEL
+        value: INFO
