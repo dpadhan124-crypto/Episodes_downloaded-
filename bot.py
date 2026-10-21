@@ -2,7 +2,7 @@
 Pocket FM Free Episode Downloader — Telegram Bot
 -----------------------------------------------
 Fetches a show from Pocket FM, filters free episodes, downloads the HLS
-streams via FFmpeg (merging every segment), and uploads complete MP3s.
+streams via FFmpeg (with yt-dlp fallback), and uploads complete MP3s.
 """
 
 import asyncio
@@ -12,8 +12,8 @@ import re
 import shlex
 import subprocess
 import tempfile
-import urllib.parse                       # <-- FIX: required for urllib.parse.unquote
-from typing import List, Optional, Tuple
+import urllib.parse
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from telegram import Update
@@ -59,12 +59,6 @@ BASE_HEADERS = {
     "app-name": "pocket_fm",
 }
 
-FFMPEG_HEADERS = (
-    "Referer: https://pocketfm.com/\r\n"
-    "Origin: https://pocketfm.com\r\n"
-    f"User-Agent: {UA}\r\n"
-)
-
 NUM_KEYS = (
     "seq_number",
     "episode_number",
@@ -83,15 +77,19 @@ MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2.0
 FFMPEG_TIMEOUT = 600
 TELEGRAM_MAX_UPLOAD = 50 * 1024 * 1024
+DEBUG_DUMP_EPISODES = int(os.environ.get("DEBUG_DUMP_EPISODES", "3"))
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
-def check_ffmpeg() -> bool:
+def check_binary(name: str) -> bool:
     try:
         subprocess.run(
-            ["ffmpeg", "-version"], capture_output=True, check=True, timeout=10
+            [name, "-version"] if name == "ffmpeg" else [name, "--version"],
+            capture_output=True,
+            check=True,
+            timeout=10,
         )
         return True
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
@@ -128,6 +126,7 @@ def is_free(episode: dict, episode_number: int, locking_point: Optional[int]) ->
 
 
 def extract_audio_candidates(episode: dict) -> List[str]:
+    """Return HTTP audio URLs in the episode, ranked (MP3 first, HLS next)."""
     urls: List[str] = []
 
     direct_keys = (
@@ -172,22 +171,37 @@ def extract_audio_candidates(episode: dict) -> List[str]:
     return sorted(unique, key=rank)
 
 
+def build_ffmpeg_headers(cookies: Dict[str, str]) -> str:
+    cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if v)
+    parts = []
+    if cookie_str:
+        parts.append(f"Cookie: {cookie_str}")
+    parts.append("Referer: https://pocketfm.com/")
+    parts.append("Origin: https://pocketfm.com")
+    parts.append(f"User-Agent: {UA}")
+    return "\r\n".join(parts) + "\r\n"
+
+
 # ---------------------------------------------------------------------------
 # Pocket FM scraper
 # ---------------------------------------------------------------------------
 
-async def _fetch_auth_token(client: httpx.AsyncClient) -> str:
-    try:
-        await client.get(SEARCH_URL, headers={"User-Agent": UA}, timeout=20)
-    except httpx.RequestError as exc:
-        logger.warning("Token bootstrap request failed: %s", exc)
-    token = urllib.parse.unquote(client.cookies.get("auth-token") or "").strip('"')
-    return token
+async def fetch_show_episodes(
+    show_id: str,
+) -> Tuple[str, Optional[int], List[dict], Dict[str, str]]:
+    """
+    Fetch show metadata + full episode list.
 
-
-async def fetch_show_episodes(show_id: str) -> Tuple[str, Optional[int], List[dict]]:
+    Returns:
+        (show_title, locking_point, episodes, cookies)
+    """
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        token = await _fetch_auth_token(client)
+        try:
+            await client.get(SEARCH_URL, headers={"User-Agent": UA}, timeout=20)
+        except httpx.RequestError as exc:
+            logger.warning("Token bootstrap request failed: %s", exc)
+
+        token = urllib.parse.unquote(client.cookies.get("auth-token") or "").strip('"')
         headers = dict(BASE_HEADERS)
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -240,10 +254,10 @@ async def fetch_show_episodes(show_id: str) -> Tuple[str, Optional[int], List[di
                     if isinstance(result.get(key), str):
                         show_title = result[key]
                         break
-                locking_point = result.get("episode_locking_point")
-                if locking_point is not None:
+                lp = result.get("episode_locking_point")
+                if lp is not None:
                     try:
-                        locking_point = int(locking_point)
+                        locking_point = int(lp)
                     except (TypeError, ValueError):
                         locking_point = None
 
@@ -264,6 +278,13 @@ async def fetch_show_episodes(show_id: str) -> Tuple[str, Optional[int], List[di
                     seen_ids.add(ep_id)
                 episodes.append(ep)
 
+                # Debug dump: helps identify which key holds the real URL
+                if len(episodes) <= DEBUG_DUMP_EPISODES:
+                    logger.info("Episode #%s keys: %s", len(episodes), list(ep.keys()))
+                    for k, v in ep.items():
+                        if isinstance(v, str) and v.startswith("http"):
+                            logger.info("  %s = %s", k, v[:140])
+
             next_ptr = data.get("next_ptr", result.get("next_ptr"))
             if isinstance(next_ptr, int) and next_ptr > ptr:
                 ptr = next_ptr
@@ -273,20 +294,23 @@ async def fetch_show_episodes(show_id: str) -> Tuple[str, Optional[int], List[di
             if len(page_episodes) < 5:
                 break
 
-        return show_title, locking_point, episodes
+        cookies = {k: v for k, v in client.cookies.items()}
+        return show_title, locking_point, episodes, cookies
 
 
 # ---------------------------------------------------------------------------
-# FFmpeg download
+# Download: FFmpeg primary, yt-dlp fallback
 # ---------------------------------------------------------------------------
 
-def _run_ffmpeg_sync(input_url: str, output_path: str) -> Tuple[bool, str]:
+def _run_ffmpeg_sync(
+    input_url: str, output_path: str, cookie_header: str
+) -> Tuple[bool, str]:
     cmd = [
         "ffmpeg",
         "-nostdin",
         "-y",
         "-loglevel", "error",
-        "-headers", FFMPEG_HEADERS,
+        "-headers", cookie_header,
         "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
         "-i", input_url,
         "-vn",
@@ -315,10 +339,48 @@ def _run_ffmpeg_sync(input_url: str, output_path: str) -> Tuple[bool, str]:
     return True, ""
 
 
-async def download_to_file(url: str, output_path: str) -> Tuple[bool, str]:
-    if ".m3u8" in url:
-        return await asyncio.to_thread(_run_ffmpeg_sync, url, output_path)
+def _run_ytdlp_sync(input_url: str, output_path: str) -> Tuple[bool, str]:
+    """Fallback downloader using yt-dlp. Strips .mp3 from output template."""
+    stem = output_path[:-4] if output_path.lower().endswith(".mp3") else output_path
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "192K",
+        "-o", stem + ".%(ext)s",
+        input_url,
+    ]
+    logger.info("yt-dlp %s", " ".join(shlex.quote(c) for c in cmd))
 
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"yt-dlp timed out after {FFMPEG_TIMEOUT}s."
+    except FileNotFoundError:
+        return False, "yt-dlp not found on PATH."
+
+    if result.returncode != 0:
+        tail = "\n".join(result.stderr.strip().splitlines()[-5:])
+        return False, f"yt-dlp exit {result.returncode}: {tail}"
+
+    if not os.path.exists(output_path):
+        return False, "yt-dlp reported success but output missing."
+    return True, ""
+
+
+async def download_to_file(
+    url: str, output_path: str, cookie_header: str
+) -> Tuple[bool, str]:
+    if ".m3u8" in url or ".mpd" in url:
+        return await asyncio.to_thread(
+            _run_ffmpeg_sync, url, output_path, cookie_header
+        )
+
+    # Direct MP3 / M4A via HTTP
     try:
         async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
             async with client.stream(
@@ -333,15 +395,42 @@ async def download_to_file(url: str, output_path: str) -> Tuple[bool, str]:
         return False, str(exc)
 
 
-async def download_episode(urls: List[str], output_path: str) -> Tuple[bool, str]:
+async def download_episode(
+    urls: List[str], output_path: str, cookie_header: str
+) -> Tuple[bool, str]:
+    """
+    Try each candidate URL in order. For each URL:
+      1. FFmpeg (or direct HTTP for MP3)
+      2. yt-dlp fallback if the first attempt fails
+    """
     last_error = "No candidate URLs."
     for url in urls:
-        ok, err = await download_to_file(url, output_path)
+        # Attempt 1: FFmpeg / HTTP
+        ok, err = await download_to_file(url, output_path, cookie_header)
         if ok and os.path.exists(output_path) and os.path.getsize(output_path) > 50_000:
             return True, ""
-        last_error = err or "Output too small."
+
+        logger.info("Primary download failed (%s); trying yt-dlp…", err)
         if os.path.exists(output_path):
-            os.remove(output_path)
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+        # Attempt 2: yt-dlp
+        ok, ytdlp_err = await asyncio.to_thread(
+            _run_ytdlp_sync, url, output_path
+        )
+        if ok and os.path.exists(output_path) and os.path.getsize(output_path) > 50_000:
+            return True, ""
+
+        last_error = f"ffmpeg: {err} | yt-dlp: {ytdlp_err}"
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
     return False, last_error
 
 
@@ -354,7 +443,7 @@ HELP_TEXT = (
     "Send a Pocket FM show *link* or *show ID* and I'll:\n"
     "  1. Fetch the show metadata\n"
     "  2. Identify free episodes (below the lock point)\n"
-    "  3. Download & merge HLS streams with FFmpeg\n"
+    "  3. Download & merge HLS streams (FFmpeg → yt-dlp fallback)\n"
     "  4. Upload each as a complete MP3\n\n"
     "⚠️ Telegram limits each bot upload to 50 MB per file."
 )
@@ -383,7 +472,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status = await update.message.reply_text("🔍 Fetching show details…")
 
     try:
-        show_title, locking_point, all_eps = await fetch_show_episodes(show_id)
+        show_title, locking_point, all_eps, cookies = await fetch_show_episodes(show_id)
         if not all_eps:
             await status.edit_text("❌ No episodes found for this show.")
             return
@@ -395,6 +484,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 free_eps.append((n, ep))
 
         lock_display = locking_point if locking_point is not None else "unknown"
+        cookie_header = build_ffmpeg_headers(cookies)
+
         await status.edit_text(
             f"📚 *{show_title}*\n"
             f"🔓 Locking point: Episode {lock_display}\n"
@@ -422,7 +513,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
 
                 try:
-                    ok, err = await download_episode(urls, out_path)
+                    ok, err = await download_episode(urls, out_path, cookie_header)
                     if not ok:
                         logger.error("Ep %s: download failed — %s", n, err)
                         skipped += 1
@@ -450,6 +541,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             duration=duration,
                         )
                     sent += 1
+                    logger.info("Ep %s uploaded (%s KB)", n, size // 1024)
 
                 except Exception as exc:
                     logger.exception("Ep %s failed: %s", n, exc)
@@ -484,13 +576,20 @@ def main() -> None:
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN environment variable is not set.")
 
-    if not check_ffmpeg():
+    if not check_binary("ffmpeg"):
         logger.error(
-            "FFmpeg is NOT available on PATH — HLS episodes will fail to download. "
+            "FFmpeg is NOT available on PATH — HLS episodes will fail. "
             "Make sure the Docker image includes ffmpeg."
         )
     else:
         logger.info("FFmpeg detected ✓")
+
+    if not check_binary("yt-dlp"):
+        logger.warning(
+            "yt-dlp is NOT available on PATH — fallback downloads disabled."
+        )
+    else:
+        logger.info("yt-dlp detected ✓")
 
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start_command))
