@@ -12,7 +12,7 @@ import re
 import shlex
 import subprocess
 import tempfile
-from pathlib import Path
+import urllib.parse                       # <-- FIX: required for urllib.parse.unquote
 from typing import List, Optional, Tuple
 
 import httpx
@@ -59,7 +59,6 @@ BASE_HEADERS = {
     "app-name": "pocket_fm",
 }
 
-# Headers handed to FFmpeg (must be CRLF-terminated)
 FFMPEG_HEADERS = (
     "Referer: https://pocketfm.com/\r\n"
     "Origin: https://pocketfm.com\r\n"
@@ -81,22 +80,18 @@ LOCK_FLAGS = ("is_locked", "locked", "is_premium", "is_paid", "is_coin_locked")
 
 MAX_PAGES = 100
 MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2.0  # seconds
-FFMPEG_TIMEOUT = 600    # 10 minutes per episode
-TELEGRAM_MAX_UPLOAD = 50 * 1024 * 1024  # 50 MB
+RETRY_BASE_DELAY = 2.0
+FFMPEG_TIMEOUT = 600
+TELEGRAM_MAX_UPLOAD = 50 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
 def check_ffmpeg() -> bool:
-    """Return True if an `ffmpeg` binary is callable."""
     try:
         subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            check=True,
-            timeout=10,
+            ["ffmpeg", "-version"], capture_output=True, check=True, timeout=10
         )
         return True
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
@@ -104,7 +99,6 @@ def check_ffmpeg() -> bool:
 
 
 def safe_filename(name: str, max_len: int = 60) -> str:
-    """Sanitize a string for use as a filename stem."""
     name = re.sub(r"[^\w\-. ]+", "_", name, flags=re.UNICODE).strip(" ._")
     return name[:max_len] or "episode"
 
@@ -134,7 +128,6 @@ def is_free(episode: dict, episode_number: int, locking_point: Optional[int]) ->
 
 
 def extract_audio_candidates(episode: dict) -> List[str]:
-    """Return HTTP audio URLs in the episode, ranked (MP3 first, HLS next)."""
     urls: List[str] = []
 
     direct_keys = (
@@ -154,7 +147,6 @@ def extract_audio_candidates(episode: dict) -> List[str]:
                 if isinstance(v, str) and v.startswith("http"):
                     urls.append(v)
 
-    # Fallback: scan any string field for a plausible audio URL
     if not urls:
         for v in episode.values():
             if isinstance(v, str) and v.startswith("http") and (
@@ -171,7 +163,6 @@ def extract_audio_candidates(episode: dict) -> List[str]:
             return 2
         return 3
 
-    # Dedupe while preserving order, then sort by preference
     seen = set()
     unique: List[str] = []
     for u in urls:
@@ -195,7 +186,6 @@ async def _fetch_auth_token(client: httpx.AsyncClient) -> str:
 
 
 async def fetch_show_episodes(show_id: str) -> Tuple[str, Optional[int], List[dict]]:
-    """Fetch show metadata + full episode list."""
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         token = await _fetch_auth_token(client)
         headers = dict(BASE_HEADERS)
@@ -250,7 +240,6 @@ async def fetch_show_episodes(show_id: str) -> Tuple[str, Optional[int], List[di
                     if isinstance(result.get(key), str):
                         show_title = result[key]
                         break
-                # locking_point may legitimately be 0 (nothing free) or absent
                 locking_point = result.get("episode_locking_point")
                 if locking_point is not None:
                     try:
@@ -327,7 +316,6 @@ def _run_ffmpeg_sync(input_url: str, output_path: str) -> Tuple[bool, str]:
 
 
 async def download_to_file(url: str, output_path: str) -> Tuple[bool, str]:
-    """Download an episode to `output_path`. Uses FFmpeg for HLS, HTTP for MP3."""
     if ".m3u8" in url:
         return await asyncio.to_thread(_run_ffmpeg_sync, url, output_path)
 
@@ -346,7 +334,6 @@ async def download_to_file(url: str, output_path: str) -> Tuple[bool, str]:
 
 
 async def download_episode(urls: List[str], output_path: str) -> Tuple[bool, str]:
-    """Try each candidate URL until one yields a valid MP3."""
     last_error = "No candidate URLs."
     for url in urls:
         ok, err = await download_to_file(url, output_path)
@@ -390,9 +377,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     show_id = match.group(0) if match else text
 
     if len(show_id) < 10:
-        await update.message.reply_text(
-            "❌ Invalid show ID or link. Please resend."
-        )
+        await update.message.reply_text("❌ Invalid show ID or link. Please resend.")
         return
 
     status = await update.message.reply_text("🔍 Fetching show details…")
@@ -476,7 +461,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         except OSError:
                             pass
 
-                await asyncio.sleep(1)  # polite rate-limit
+                await asyncio.sleep(1)
 
         await update.message.reply_text(
             f"✅ Finished. Sent: {sent} | Skipped: {skipped}"
