@@ -1,22 +1,38 @@
+"""
+Pocket FM Free Episode Downloader — Telegram Bot
+-----------------------------------------------
+Fetches a show from Pocket FM, filters free episodes, downloads the HLS
+streams via FFmpeg (merging every segment), and uploads complete MP3s.
+"""
+
 import asyncio
 import logging
 import os
 import re
 import shlex
 import subprocess
-import urllib.parse
+import tempfile
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import httpx
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, filters
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 logger = logging.getLogger(__name__)
 
@@ -27,6 +43,9 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+API_BASE = "https://api.pocketfm.com/v2/content_api/show.get_details"
+SEARCH_URL = "https://pocketfm.com/search"
 
 BASE_HEADERS = {
     "User-Agent": UA,
@@ -40,9 +59,10 @@ BASE_HEADERS = {
     "app-name": "pocket_fm",
 }
 
-# Headers used by FFmpeg when fetching HLS segments
+# Headers handed to FFmpeg (must be CRLF-terminated)
 FFMPEG_HEADERS = (
-    f"Referer: https://pocketfm.com/\r\n"
+    "Referer: https://pocketfm.com/\r\n"
+    "Origin: https://pocketfm.com\r\n"
     f"User-Agent: {UA}\r\n"
 )
 
@@ -53,34 +73,132 @@ NUM_KEYS = (
     "index",
     "ep_no",
     "episode_no",
+    "number",
 )
+TITLE_KEYS = ("story_title", "title", "episode_title", "name")
+SHOW_TITLE_KEYS = ("show_title", "title", "name")
+LOCK_FLAGS = ("is_locked", "locked", "is_premium", "is_paid", "is_coin_locked")
 
+MAX_PAGES = 100
 MAX_RETRIES = 3
-RETRY_DELAY = 2  # seconds
+RETRY_BASE_DELAY = 2.0  # seconds
+FFMPEG_TIMEOUT = 600    # 10 minutes per episode
+TELEGRAM_MAX_UPLOAD = 50 * 1024 * 1024  # 50 MB
 
 # ---------------------------------------------------------------------------
-# Pocket FM scraper (advanced)
+# Utilities
+# ---------------------------------------------------------------------------
+
+def check_ffmpeg() -> bool:
+    """Return True if an `ffmpeg` binary is callable."""
+    try:
+        subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+
+def safe_filename(name: str, max_len: int = 60) -> str:
+    """Sanitize a string for use as a filename stem."""
+    name = re.sub(r"[^\w\-. ]+", "_", name, flags=re.UNICODE).strip(" ._")
+    return name[:max_len] or "episode"
+
+
+def get_episode_number(episode: dict, fallback: int) -> int:
+    for key in NUM_KEYS:
+        value = episode.get(key)
+        if str(value).isdigit():
+            return int(value)
+    return fallback
+
+
+def get_episode_title(episode: dict, number: int) -> str:
+    for key in TITLE_KEYS:
+        value = episode.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return f"Episode {number}"
+
+
+def is_free(episode: dict, episode_number: int, locking_point: Optional[int]) -> bool:
+    if locking_point is not None and episode_number > locking_point:
+        return False
+    if any(episode.get(flag) for flag in LOCK_FLAGS):
+        return False
+    return True
+
+
+def extract_audio_candidates(episode: dict) -> List[str]:
+    """Return HTTP audio URLs in the episode, ranked (MP3 first, HLS next)."""
+    urls: List[str] = []
+
+    direct_keys = (
+        "audio_url", "mp3_url", "file_url", "audio", "stream", "media",
+        "hls", "hls_url", "dash_url", "audio_url_hls", "audio_url_mp3",
+    )
+    for key in direct_keys:
+        v = episode.get(key)
+        if isinstance(v, str) and v.startswith("http"):
+            urls.append(v)
+
+    for container_key in ("media_meta", "audio_meta", "streaming", "media", "audio_file"):
+        container = episode.get(container_key)
+        if isinstance(container, dict):
+            for key in ("url", "mp3_url", "audio_url", "hls_url", "hls", "dash_url", "mp3"):
+                v = container.get(key)
+                if isinstance(v, str) and v.startswith("http"):
+                    urls.append(v)
+
+    # Fallback: scan any string field for a plausible audio URL
+    if not urls:
+        for v in episode.values():
+            if isinstance(v, str) and v.startswith("http") and (
+                ".mp3" in v or ".m3u8" in v or ".m4a" in v
+            ):
+                urls.append(v)
+
+    def rank(url: str) -> int:
+        if ".mp3" in url:
+            return 0
+        if ".m3u8" in url:
+            return 1
+        if ".m4a" in url:
+            return 2
+        return 3
+
+    # Dedupe while preserving order, then sort by preference
+    seen = set()
+    unique: List[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    return sorted(unique, key=rank)
+
+
+# ---------------------------------------------------------------------------
+# Pocket FM scraper
 # ---------------------------------------------------------------------------
 
 async def _fetch_auth_token(client: httpx.AsyncClient) -> str:
-    """Visit the search page to obtain an auth-token cookie."""
-    await client.get("https://pocketfm.com/search", headers={"User-Agent": UA})
+    try:
+        await client.get(SEARCH_URL, headers={"User-Agent": UA}, timeout=20)
+    except httpx.RequestError as exc:
+        logger.warning("Token bootstrap request failed: %s", exc)
     token = urllib.parse.unquote(client.cookies.get("auth-token") or "").strip('"')
-    if not token:
-        logger.warning("No auth-token cookie found; proceeding without Authorization header.")
     return token
 
 
 async def fetch_show_episodes(show_id: str) -> Tuple[str, Optional[int], List[dict]]:
-    """
-    Fetch all episodes for a Pocket FM show.
-
-    Returns:
-        (show_title, locking_point, list_of_episode_dicts)
-    """
+    """Fetch show metadata + full episode list."""
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         token = await _fetch_auth_token(client)
-        headers = {**BASE_HEADERS}
+        headers = dict(BASE_HEADERS)
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
@@ -88,62 +206,74 @@ async def fetch_show_episodes(show_id: str) -> Tuple[str, Optional[int], List[di
         ptr = 0
         locking_point: Optional[int] = None
         show_title = "Unknown Show"
+        seen_ids = set()
 
-        for page in range(50):
-            params = {
-                "show_id": show_id,
-                "curr_ptr": ptr,
-                "info_level": "max",
-            }
+        for page_idx in range(MAX_PAGES):
+            params = {"show_id": show_id, "curr_ptr": ptr, "info_level": "max"}
 
-            # Retry loop for transient network errors
+            resp: Optional[httpx.Response] = None
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
-                    resp = await client.get(
-                        "https://api.pocketfm.com/v2/content_api/show.get_details",
-                        params=params,
-                        headers=headers,
-                    )
+                    resp = await client.get(API_BASE, params=params, headers=headers)
                     if resp.status_code == 200:
                         break
                     logger.warning(
-                        "Show details HTTP %s (attempt %s/%s)",
-                        resp.status_code,
-                        attempt,
-                        MAX_RETRIES,
+                        "Page %s: HTTP %s (attempt %s/%s)",
+                        page_idx, resp.status_code, attempt, MAX_RETRIES,
                     )
                 except httpx.RequestError as exc:
                     logger.warning(
-                        "Request error on page %s (attempt %s/%s): %s",
-                        page,
-                        attempt,
-                        MAX_RETRIES,
-                        exc,
+                        "Page %s: request error %s (attempt %s/%s)",
+                        page_idx, exc, attempt, MAX_RETRIES,
                     )
-
                 if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY * attempt)
+                    await asyncio.sleep(RETRY_BASE_DELAY * attempt)
 
-            else:
-                logger.error("Failed to fetch show details after %s retries.", MAX_RETRIES)
+            if resp is None or resp.status_code != 200:
+                logger.error("Giving up on page %s after retries.", page_idx)
                 break
 
-            data = resp.json()
-            if not data.get("result"):
-                logger.info("No result on page %s; stopping.", page)
+            try:
+                data = resp.json()
+            except ValueError:
+                logger.error("Page %s: invalid JSON.", page_idx)
                 break
 
-            result = data["result"][0]
+            result_list = data.get("result") or []
+            if not result_list:
+                break
 
-            if page == 0:
-                show_title = result.get("show_title", "Unknown Show")
-                locking_point = result.get("episode_locking_point", 0)
+            result = result_list[0]
 
-            page_episodes = result.get("stories", [])
+            if page_idx == 0:
+                for key in SHOW_TITLE_KEYS:
+                    if isinstance(result.get(key), str):
+                        show_title = result[key]
+                        break
+                # locking_point may legitimately be 0 (nothing free) or absent
+                locking_point = result.get("episode_locking_point")
+                if locking_point is not None:
+                    try:
+                        locking_point = int(locking_point)
+                    except (TypeError, ValueError):
+                        locking_point = None
+
+            page_episodes = (
+                result.get("stories")
+                or result.get("episodes")
+                or result.get("data")
+                or []
+            )
             if not page_episodes:
                 break
 
-            episodes.extend(page_episodes)
+            for ep in page_episodes:
+                ep_id = ep.get("story_id") or ep.get("id") or ep.get("episode_id")
+                if ep_id and ep_id in seen_ids:
+                    continue
+                if ep_id:
+                    seen_ids.add(ep_id)
+                episodes.append(ep)
 
             next_ptr = data.get("next_ptr", result.get("next_ptr"))
             if isinstance(next_ptr, int) and next_ptr > ptr:
@@ -157,130 +287,55 @@ async def fetch_show_episodes(show_id: str) -> Tuple[str, Optional[int], List[di
         return show_title, locking_point, episodes
 
 
-def _episode_number(episode: dict, fallback: int) -> int:
-    """Extract the episode number from whichever key is present."""
-    for key in NUM_KEYS:
-        value = episode.get(key)
-        if str(value).isdigit():
-            return int(value)
-    return fallback
-
-
-def _is_free(episode: dict, episode_number: int, locking_point: Optional[int]) -> bool:
-    """Determine whether an episode is free."""
-    if locking_point is not None and episode_number > locking_point:
-        return False
-
-    lock_flags = {
-        key: episode[key]
-        for key in (
-            "is_locked",
-            "locked",
-            "is_premium",
-            "is_paid",
-            "is_coin_locked",
-        )
-        if key in episode
-    }
-    if any(lock_flags.values()):
-        return False
-
-    return True
-
-
-def _extract_audio_url(episode: dict) -> Optional[str]:
-    """Find the best audio URL in an episode payload."""
-    # Prefer direct MP3
-    for key in ("audio_url", "mp3_url", "file_url", "audio", "stream", "media"):
-        value = episode.get(key)
-        if isinstance(value, str) and value.startswith("http") and ".mp3" in value:
-            return value
-
-    # Check nested media_meta
-    media_meta = episode.get("media_meta")
-    if isinstance(media_meta, dict):
-        value = media_meta.get("url")
-        if isinstance(value, str) and value.startswith("http"):
-            return value
-
-    # Fall back to HLS / m3u8
-    for key in ("hls", "stream", "audio_url", "file_url"):
-        value = episode.get(key)
-        if isinstance(value, str) and value.startswith("http") and ".m3u8" in value:
-            return value
-
-    # Last resort: scan all string values
-    for value in episode.values():
-        if isinstance(value, str) and value.startswith("http"):
-            if ".mp3" in value or ".m3u8" in value:
-                return value
-
-    return None
-
-
 # ---------------------------------------------------------------------------
-# FFmpeg download / merge
+# FFmpeg download
 # ---------------------------------------------------------------------------
 
-def _run_ffmpeg(input_url: str, output_path: str) -> Tuple[bool, str]:
-    """
-    Use FFmpeg to download and merge an HLS playlist into a single MP3.
-
-    Returns:
-        (success, error_message)
-    """
+def _run_ffmpeg_sync(input_url: str, output_path: str) -> Tuple[bool, str]:
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-y",
-        "-headers",
-        FFMPEG_HEADERS,
-        "-i",
-        input_url,
+        "-loglevel", "error",
+        "-headers", FFMPEG_HEADERS,
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+        "-i", input_url,
         "-vn",
-        "-acodec",
-        "libmp3lame",
-        "-ab",
-        "192k",
+        "-acodec", "libmp3lame",
+        "-ab", "192k",
+        "-f", "mp3",
         output_path,
     ]
-
-    logger.info("Running FFmpeg: %s", " ".join(shlex.quote(c) for c in cmd))
+    logger.info("ffmpeg %s", " ".join(shlex.quote(c) for c in cmd))
 
     try:
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 minutes per episode; adjust as needed
+            cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return False, "FFmpeg timed out after 600 seconds."
+        return False, f"FFmpeg timed out after {FFMPEG_TIMEOUT}s."
     except FileNotFoundError:
-        return False, "FFmpeg executable not found. Please install FFmpeg."
+        return False, "FFmpeg not found on PATH."
 
     if result.returncode != 0:
-        # Return the last few lines of stderr for diagnostics
-        error_tail = "\n".join(result.stderr.strip().splitlines()[-5:])
-        return False, f"FFmpeg exited with {result.returncode}: {error_tail}"
+        tail = "\n".join(result.stderr.strip().splitlines()[-5:])
+        return False, f"FFmpeg exit {result.returncode}: {tail}"
 
     if not os.path.exists(output_path):
-        return False, "FFmpeg reported success but output file is missing."
-
+        return False, "FFmpeg reported success but output missing."
     return True, ""
 
 
-async def download_episode_audio(audio_url: str, output_path: str) -> Tuple[bool, str]:
-    """
-    Download an episode's audio. Uses FFmpeg for HLS streams, direct HTTP for MP3.
-    """
-    if ".m3u8" in audio_url:
-        # Run FFmpeg in a thread so we don't block the event loop
-        return await asyncio.to_thread(_run_ffmpeg, audio_url, output_path)
+async def download_to_file(url: str, output_path: str) -> Tuple[bool, str]:
+    """Download an episode to `output_path`. Uses FFmpeg for HLS, HTTP for MP3."""
+    if ".m3u8" in url:
+        return await asyncio.to_thread(_run_ffmpeg_sync, url, output_path)
 
-    # Direct MP3 download
     try:
         async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-            async with client.stream("GET", audio_url, headers={"User-Agent": UA}) as resp:
+            async with client.stream(
+                "GET", url, headers={"User-Agent": UA}
+            ) as resp:
                 resp.raise_for_status()
                 with open(output_path, "wb") as fh:
                     async for chunk in resp.aiter_bytes():
@@ -290,111 +345,149 @@ async def download_episode_audio(audio_url: str, output_path: str) -> Tuple[bool
         return False, str(exc)
 
 
+async def download_episode(urls: List[str], output_path: str) -> Tuple[bool, str]:
+    """Try each candidate URL until one yields a valid MP3."""
+    last_error = "No candidate URLs."
+    for url in urls:
+        ok, err = await download_to_file(url, output_path)
+        if ok and os.path.exists(output_path) and os.path.getsize(output_path) > 50_000:
+            return True, ""
+        last_error = err or "Output too small."
+        if os.path.exists(output_path):
+            os.remove(output_path)
+    return False, last_error
+
+
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
 
+HELP_TEXT = (
+    "👋 *Pocket FM Free Episode Downloader*\n\n"
+    "Send a Pocket FM show *link* or *show ID* and I'll:\n"
+    "  1. Fetch the show metadata\n"
+    "  2. Identify free episodes (below the lock point)\n"
+    "  3. Download & merge HLS streams with FFmpeg\n"
+    "  4. Upload each as a complete MP3\n\n"
+    "⚠️ Telegram limits each bot upload to 50 MB per file."
+)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "👋 Welcome to the Pocket FM Free Episode Downloader!\n\n"
-        "Send me a Pocket FM **show link** or **show ID** and I will fetch "
-        "all free episodes as MP3 files."
-    )
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip()
+    if not update.message or not update.message.text:
+        return
 
-    # Extract a 40-char hex show ID from a URL, or use the raw text
+    text = update.message.text.strip()
     match = re.search(r"[a-f0-9]{40}", text, re.IGNORECASE)
     show_id = match.group(0) if match else text
 
     if len(show_id) < 10:
         await update.message.reply_text(
-            "❌ Invalid show ID or link. Please send a valid Pocket FM link or ID."
+            "❌ Invalid show ID or link. Please resend."
         )
         return
 
-    status_msg = await update.message.reply_text(
-        "🔍 Fetching show details and checking free episodes…"
-    )
+    status = await update.message.reply_text("🔍 Fetching show details…")
 
     try:
-        show_title, locking_point, all_episodes = await fetch_show_episodes(show_id)
-
-        if not all_episodes:
-            await status_msg.edit_text("❌ No episodes found for this show.")
+        show_title, locking_point, all_eps = await fetch_show_episodes(show_id)
+        if not all_eps:
+            await status.edit_text("❌ No episodes found for this show.")
             return
 
-        # Filter free episodes
-        free_episodes: List[Tuple[int, dict]] = []
-        for idx, episode in enumerate(all_episodes, start=1):
-            ep_num = _episode_number(episode, idx)
-            if _is_free(episode, ep_num, locking_point):
-                free_episodes.append((ep_num, episode))
+        free_eps: List[Tuple[int, dict]] = []
+        for idx, ep in enumerate(all_eps, start=1):
+            n = get_episode_number(ep, idx)
+            if is_free(ep, n, locking_point):
+                free_eps.append((n, ep))
 
-        await status_msg.edit_text(
+        lock_display = locking_point if locking_point is not None else "unknown"
+        await status.edit_text(
             f"📚 *{show_title}*\n"
-            f"🔓 Locking point: Episode {locking_point}\n"
-            f"📦 Total episodes: {len(all_episodes)} | Free: {len(free_episodes)}\n\n"
-            f"📤 Starting upload of free episodes…",
-            parse_mode="Markdown",
+            f"🔓 Locking point: Episode {lock_display}\n"
+            f"📦 Total: {len(all_eps)} | 🆓 Free: {len(free_eps)}\n\n"
+            f"📤 Starting upload…",
+            parse_mode=ParseMode.MARKDOWN,
         )
 
-        if not free_episodes:
+        if not free_eps:
             await update.message.reply_text("⚠️ No free episodes found for this show.")
             return
 
-        for ep_num, episode in free_episodes:
-            ep_title = (
-                episode.get("story_title")
-                or episode.get("title")
-                or f"Episode {ep_num}"
-            )
-
-            audio_url = _extract_audio_url(episode)
-            if not audio_url:
-                logger.warning("Episode %s: no audio URL found, skipping.", ep_num)
-                continue
-
-            output_file = f"Ep_{ep_num}.mp3"
-
-            try:
-                success, error = await download_episode_audio(audio_url, output_file)
-                if not success:
-                    logger.error("Episode %s download failed: %s", ep_num, error)
+        sent, skipped = 0, 0
+        with tempfile.TemporaryDirectory(prefix="pocketfm_") as tmpdir:
+            for n, ep in free_eps:
+                ep_title = get_episode_title(ep, n)
+                urls = extract_audio_candidates(ep)
+                if not urls:
+                    logger.warning("Ep %s: no audio URL found.", n)
+                    skipped += 1
                     continue
 
-                file_size = os.path.getsize(output_file)
-                if file_size < 50_000:  # sanity check: at least 50 KB
-                    logger.warning(
-                        "Episode %s output is suspiciously small (%s bytes), skipping.",
-                        ep_num,
-                        file_size,
-                    )
-                    continue
+                out_path = os.path.join(
+                    tmpdir, f"Ep_{n}_{safe_filename(ep_title)}.mp3"
+                )
 
-                with open(output_file, "rb") as audio_file:
-                    await update.message.reply_audio(
-                        audio=audio_file,
-                        title=ep_title,
-                        performer=show_title,
-                        caption=f"🎧 Ep {ep_num}: {ep_title}",
-                    )
+                try:
+                    ok, err = await download_episode(urls, out_path)
+                    if not ok:
+                        logger.error("Ep %s: download failed — %s", n, err)
+                        skipped += 1
+                        continue
 
-            except Exception as exc:
-                logger.exception("Episode %s failed: %s", ep_num, exc)
-            finally:
-                if os.path.exists(output_file):
-                    os.remove(output_file)
+                    size = os.path.getsize(out_path)
+                    if size > TELEGRAM_MAX_UPLOAD:
+                        logger.warning(
+                            "Ep %s: %s MB exceeds Telegram limit, skipping upload.",
+                            n, size // (1024 * 1024),
+                        )
+                        skipped += 1
+                        continue
 
-            await asyncio.sleep(1)  # polite rate limiting
+                    duration = None
+                    if isinstance(ep.get("duration"), (int, float)):
+                        duration = int(ep["duration"])
 
-        await update.message.reply_text("✅ All free episodes have been sent!")
+                    with open(out_path, "rb") as fh:
+                        await update.message.reply_audio(
+                            audio=fh,
+                            title=ep_title,
+                            performer=show_title,
+                            caption=f"🎧 Ep {n}: {ep_title}",
+                            duration=duration,
+                        )
+                    sent += 1
+
+                except Exception as exc:
+                    logger.exception("Ep %s failed: %s", n, exc)
+                    skipped += 1
+                finally:
+                    if os.path.exists(out_path):
+                        try:
+                            os.remove(out_path)
+                        except OSError:
+                            pass
+
+                await asyncio.sleep(1)  # polite rate-limit
+
+        await update.message.reply_text(
+            f"✅ Finished. Sent: {sent} | Skipped: {skipped}"
+        )
 
     except Exception as exc:
-        logger.exception("Unhandled error while processing show %s", show_id)
-        await status_msg.edit_text(f"❌ An error occurred: {exc}")
+        logger.exception("Show %s failed", show_id)
+        try:
+            await status.edit_text(f"❌ Error: {exc}")
+        except Exception:
+            await update.message.reply_text(f"❌ Error: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -404,15 +497,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set.")
+        raise SystemExit("TELEGRAM_BOT_TOKEN environment variable is not set.")
+
+    if not check_ffmpeg():
+        logger.error(
+            "FFmpeg is NOT available on PATH — HLS episodes will fail to download. "
+            "Make sure the Docker image includes ffmpeg."
+        )
+    else:
+        logger.info("FFmpeg detected ✓")
 
     app = ApplicationBuilder().token(token).build()
-
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
 
     logger.info("Bot is starting…")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
