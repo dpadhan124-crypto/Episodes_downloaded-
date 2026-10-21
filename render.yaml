@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: pocketfm-telegram-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
