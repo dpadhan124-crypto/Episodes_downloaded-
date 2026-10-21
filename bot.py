@@ -117,27 +117,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             for n, e in free_eps:
                 ep_title = e.get("story_title") or e.get("title") or f"Episode {n}"
-                # Extract media/audio stream URL safely
-                audio_url = e.get("audio") or e.get("stream") or e.get("hls") or e.get("media")
                 
-                # If nested inside media dictionaries
+                # Check for direct mp3 or fallback stream keys
+                audio_url = None
+                for key in ("audio_url", "mp3_url", "file_url", "audio", "stream", "media"):
+                    val = e.get(key)
+                    if isinstance(val, str) and val.startswith("http") and ".mp3" in val:
+                        audio_url = val
+                        break
+
                 if not audio_url and isinstance(e.get("media_meta"), dict):
                     audio_url = e["media_meta"].get("url")
 
+                # If only HLS (.m3u8) or other links are found, scan all dict values for a direct .mp3 file
                 if not audio_url:
-                    # Look for any key containing stream/url/audio in dict values
                     for val in e.values():
-                        if isinstance(val, str) and val.startswith("http") and any(ext in val for ext in [".mp3", ".m4a", ".aac", "m3u8"]):
+                        if isinstance(val, str) and val.startswith("http") and ".mp3" in val:
                             audio_url = val
                             break
+
+                # Fallback: if we only have the m3u8 stream, try to locate a direct audio stream or skip/handle accordingly
+                if not audio_url:
+                    # Look for hls or stream url if no direct mp3 exists
+                    audio_url = e.get("hls") or e.get("stream")
 
                 if not audio_url:
                     continue
 
                 try:
-                    # Download audio stream chunk or file
-                    resp = await client.get(audio_url)
-                    if resp.status_code == 200:
+                    # If the URL is an m3u8 playlist, we need to extract the actual segment or find an alternative direct link
+                    if ".m3u8" in audio_url:
+                        resp = await client.get(audio_url)
+                        if resp.status_code == 200:
+                            lines = resp.text.splitlines()
+                            segments = [line.strip() for line in lines if line and not line.startswith("#")]
+                            if segments:
+                                base_segment_url = urllib.parse.urljoin(audio_url, segments[0])
+                                resp = await client.get(base_segment_url)
+
+                    else:
+                        resp = await client.get(audio_url)
+
+                    if resp.status_code == 200 and len(resp.content) > 5000: # Ensure it's valid audio data (>5KB)
                         file_name = f"Ep_{n}_{ep_title[:30].strip()}.mp3".replace("/", "_")
                         with open(file_name, "wb") as f:
                             f.write(resp.content)
@@ -150,6 +171,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 caption=f"🎧 Ep {n}: {ep_title}"
                             )
                         os.remove(file_name)
+                    else:
+                        logger.warning(f"Skipped episode {n}: Audio payload too small or invalid.")
+                    
                     await asyncio.sleep(1) # Prevent flooding Telegram API
                 except Exception as ex:
                     logger.error(f"Failed to send episode {n}: {ex}")
